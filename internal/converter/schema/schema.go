@@ -55,6 +55,7 @@ func MessageToSchema(opts options.Options, tt protoreflect.MessageDescriptor) (s
 	s.Properties = props
 
 	if len(oneOneGroups) > 0 {
+		slog.Debug("Hey Dave again!")
 		// make all of groups
 		groupKeys := []protoreflect.FullName{}
 		for key := range oneOneGroups {

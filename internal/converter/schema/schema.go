@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 
 	"github.com/pb33f/libopenapi/datamodel/high/base"
 	"github.com/pb33f/libopenapi/orderedmap"
@@ -13,6 +14,11 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"gopkg.in/yaml.v3"
 )
+
+type oneOfField struct {
+	fieldName   string
+	messageDesc protoreflect.MessageDescriptor
+}
 
 func MessageToSchema(opts options.Options, tt protoreflect.MessageDescriptor) (string, *base.Schema) {
 	slog.Debug("messageToSchema", slog.Any("descriptor", tt.FullName()))
@@ -35,25 +41,32 @@ func MessageToSchema(opts options.Options, tt protoreflect.MessageDescriptor) (s
 		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 1, B: false},
 	}
 
-	oneOneGroups := map[protoreflect.FullName][]string{}
-
-	props := orderedmap.New[string, *base.SchemaProxy]()
+	oneOneGroups := map[protoreflect.FullName][]oneOfField{}
+	regularProps := orderedmap.New[string, *base.SchemaProxy]()
 	fields := tt.Fields()
 	for i := 0; i < fields.Len(); i++ {
 		field := fields.Get(i)
 		if oneOf := field.ContainingOneof(); oneOf != nil && !oneOf.IsSynthetic() {
-			oneOneGroups[oneOf.FullName()] = append(oneOneGroups[oneOf.FullName()], util.MakeFieldName(opts, field))
+			// Add the one groups in one specific list
+			oneOneGroups[oneOf.FullName()] = append(
+				oneOneGroups[oneOf.FullName()],
+				oneOfField{
+					fieldName:   util.MakeFieldName(opts, field),
+					messageDesc: field.Message(),
+				},
+			)
+
+			continue
 		}
 		prop := FieldToSchema(opts, base.CreateSchemaProxy(s), field)
 		if field.HasOptionalKeyword() {
 			nullable := true
 			prop.Schema().Nullable = &nullable
 		}
-		props.Set(util.MakeFieldName(opts, field), prop)
+		regularProps.Set(util.MakeFieldName(opts, field), prop)
 	}
 
-	s.Properties = props
-
+	s.Properties = regularProps
 	if len(oneOneGroups) > 0 {
 		// make all of groups
 		groupKeys := []protoreflect.FullName{}
@@ -64,11 +77,13 @@ func MessageToSchema(opts options.Options, tt protoreflect.MessageDescriptor) (s
 		allOfs := []*base.SchemaProxy{}
 		for _, key := range groupKeys {
 			items := oneOneGroups[key]
-			slices.Sort(items)
+			slices.SortFunc(items, func(a, b oneOfField) int {
+				return strings.Compare(a.fieldName, b.fieldName)
+			})
 			allOfs = append(allOfs, makeOneOfGroup(items))
 		}
 		if len(allOfs) == 1 {
-			s.AnyOf = allOfs[0].Schema().AnyOf
+			s.OneOf = allOfs[0].Schema().OneOf
 		} else {
 			s.AllOf = append(s.AllOf, allOfs...)
 		}
@@ -184,14 +199,34 @@ func ReferenceFieldToSchema(opts options.Options, parent *base.SchemaProxy, tt p
 	}
 }
 
-func makeOneOfGroup(fields []string) *base.SchemaProxy {
-	nestedSchemas := make([]*base.SchemaProxy, 0, len(fields))
-	rootSchemas := make([]*base.SchemaProxy, 0, len(fields)+1)
+func makeOneOfGroup(fields []oneOfField) *base.SchemaProxy {
+	rootSchemas := make([]*base.SchemaProxy, 0, len(fields))
 	for _, field := range fields {
-		rootSchemas = append(rootSchemas, base.CreateSchemaProxy(&base.Schema{Required: []string{field}}))
-		nestedSchemas = append(nestedSchemas, base.CreateSchemaProxy(&base.Schema{Required: []string{field}}))
+		schema := &base.Schema{
+			Type:       []string{"object"},
+			Title:      field.fieldName,
+			Properties: orderedmap.New[string, *base.SchemaProxy](),
+		}
+
+		// Create the reference extension
+		extensions := orderedmap.New[string, *yaml.Node]()
+		slog.Debug("---------field-----------", field.fieldName)
+		slog.Debug("---------FULLNAME FIELD-----------", field.messageDesc.FullName())
+		fullName := string(
+			field.messageDesc.FullName(),
+		)
+		extensions.Set("$ref", utils.CreateStringNode(fmt.Sprintf("#/components/schemas/%s", fullName)))
+
+		// Create property schema with the reference
+		propSchema := &base.Schema{
+			Extensions: extensions,
+		}
+
+		schema.Properties.Set(field.fieldName, base.CreateSchemaProxy(propSchema))
+		schema.Required = []string{field.fieldName}
+
+		rootSchemas = append(rootSchemas, base.CreateSchemaProxy(schema))
 	}
 
-	rootSchemas = append(rootSchemas, base.CreateSchemaProxy(&base.Schema{Not: base.CreateSchemaProxy(&base.Schema{AnyOf: nestedSchemas})}))
-	return base.CreateSchemaProxy(&base.Schema{AnyOf: rootSchemas})
+	return base.CreateSchemaProxy(&base.Schema{OneOf: rootSchemas})
 }
